@@ -712,8 +712,15 @@ post '/systems/:system_id/status' => sub {
 
 any '/systems/:system_id/:part' => sub {
 	my $c = shift;
-	$c->app->log->info('Unimplemented request: ' . $c->stash->{'part'});
-	$c->render(text=>'', format=>'txt');
+	my $part = $c->stash->{'part'};
+	my $text = $c->stash->{pass_res};
+	if (defined($text) and length($text)) {
+		$c->app->log->info("Relaying Carrier response for: $part");
+		$c->render(text=>$text, format=>$c->stash('format')||'xml');
+	} else {
+		$c->app->log->info("Unimplemented request: $part");
+		$c->render(text=>'', format=>'txt');
+	}
 };
 
 websocket '/serial' => sub {
