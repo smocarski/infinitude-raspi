@@ -361,7 +361,7 @@ hook before_dispatch => sub {
 			$c->stash->{pass_res} = $tx->res->body;
 			$c->stash->{format} = 'xml' if ($tx->res->headers->content_type//'') =~ /xml/;
 			$store->set("$nk.xml", $tx->res->body)
-			  if ($tx->res->headers->content_type//'' =~ /xml/);
+			  if (($tx->res->headers->content_type//'') =~ /xml/);
 		} else {
 			$c->app->log->info("$nk cached or passthru disabled");
 		}
