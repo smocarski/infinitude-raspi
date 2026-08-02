@@ -53,7 +53,6 @@ $config->{serial_tty}    = $ENV{SERIAL_TTY}    || $config->{serial_tty};
 $config->{serial_socket} = $ENV{SERIAL_SOCKET} || $config->{serial_socket};
 $config->{app_secret}    = $ENV{APP_SECRET}    || $config->{app_secret};
 $config->{pass_reqs}     = $ENV{PASS_REQS}     || $config->{pass_reqs};
-$config->{carrier_push}  = $ENV{CARRIER_PUSH}  || $config->{carrier_push};
 $config->{emulate_sam}   = $ENV{EMULATE_SAM}   || $config->{emulate_sam};
 $config->{emulate_zc}    = $ENV{EMULATE_ZC}    || $config->{emulate_zc};
 $config->{mqtt_broker}   = $ENV{MQTT_BROKER}   || $config->{mqtt_broker};
@@ -692,38 +691,8 @@ get '/systems/:id/config' => sub {
 	  $c->render(text=>$c->stash->{pass_res}, format=>'xml');
 	} else {
 	  my $xml = XML::Simple::Minded->new($store->get('systems.xml'));
-	  my $struc = $xml->system->config();
-
-	  # Carrier wraps its config documents in an envelope that ours lacks: a
-	  # version attribute, the atom namespace and links, and a timestamp.
-	  # Without it the stat applies our config but never uploads the result,
-	  # so Carrier is told "settings updated" via notifications and is never
-	  # told what they are. Mirror the envelope, reusing the version and links
-	  # from the last config Carrier actually sent us.
-	  if ($config->{carrier_push}) {
-	    try {
-	      $struc = decode_json($struc->_as_json);
-	      my $last = $store->get(($c->stash->{action_key}//'').'.xml') // '';
-
-	      my ($version) = $last =~ /<config\b[^>]*\bversion="([^"]+)"/;
-	      $struc->{version} = $version if $version;
-	      $struc->{'xmlns:atom'} = 'http://www.w3.org/2005/Atom';
-	      $struc->{timestamp} = [DateTime->now->strftime('%FT%T.000Z')];
-
-	      my @links;
-	      while ($last =~ /<atom:link\b([^>]*?)\/?>/g) {
-	        my %attr = $1 =~ /([\w:]+)="([^"]*)"/g;
-	        push @links, \%attr if $attr{href};
-	      }
-	      $struc->{'atom:link'} = \@links if @links;
-	    } catch {
-	      $c->app->log->error("carrier_push: could not build config envelope: $_");
-	      $struc = $xml->system->config();
-	    };
-	  }
-
-	  my $cfg = XML::Simple::Minded->new({config=>$struc});
-	  $c->render(text=>$cfg, format=>'xml');
+	  my $config = XML::Simple::Minded->new({config=>$xml->system->config()});
+	  $c->render(text=>$config, format=>'xml');
 	}
 };
 
