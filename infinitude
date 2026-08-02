@@ -660,6 +660,35 @@ get '/systems/:id/config' => sub {
 	if ($store->get('carrier_changes') and $c->stash->{pass_res}) {
 	  $store->set(carrier_changes => '' );
 	  $store->set(changes => time+60); # Force a followup stat->infinitude push/pull cycle after 1m
+
+	  # Persist Carrier's config locally. Without this the stat gets the new
+	  # config but systems.xml keeps the old one, so Infinitude's own UI shows
+	  # stale values until the stat happens to upload its config back to us.
+	  try {
+	    my $incoming = decode_json(
+	      XML::Simple::Minded->new($c->stash->{pass_res})->config->_as_json);
+	    # Envelope fields belong on the wire, not in systems.xml
+	    delete @{$incoming}{qw/version timestamp xmlns:atom atom:link/};
+
+	    my $xml     = XML::Simple::Minded->new($store->get('systems.xml'));
+	    my $current = decode_json($xml->system->config->_as_json);
+	    # Overlay: Carrier wins where it speaks, but keep fields only the stat
+	    # reports (blower telemetry and friends) rather than dropping them.
+	    my $merged  = { %$current, %$incoming };
+
+	    die "no mode in merged config\n" unless $merged->{mode};
+	    $xml->system->config([$merged]);
+	    my $out = "$xml";
+	    die "empty serialization\n" unless length($out) > 100;
+
+	    $store->set('systems.xml'  => $out);
+	    $store->set('systems.json' => $xml->_as_json);
+	    $mqtt->publish_state if $mqtt;
+	    $c->app->log->info('Persisted Carrier config to systems.xml');
+	  } catch {
+	    $c->app->log->error("Could not persist Carrier config: $_");
+	  };
+
 	  $c->render(text=>$c->stash->{pass_res}, format=>'xml');
 	} else {
 	  my $xml = XML::Simple::Minded->new($store->get('systems.xml'));
