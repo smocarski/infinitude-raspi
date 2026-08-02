@@ -1,0 +1,55 @@
+ARG BASE_IMAGE=debian:bookworm-slim
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cpanminus \
+        libchi-perl \
+        libdatetime-perl \
+        libio-pty-perl \
+        libjson-perl \
+        libmojolicious-perl \
+        libmoo-perl \
+        libpath-tiny-perl \
+        libxml-simple-perl \
+        libexpat1-dev \
+	libxml-parser-perl \
+        openssl \
+        perl \
+    && cpanm --notest \
+        Data::ParseBinary \
+        Digest::CRC \
+        Hash::AsObject \
+        IO::Termios \
+        XML::Parser \
+	XML::SAX \
+        Net::MQTT::Simple \
+    && apt-get purge -y --auto-remove \
+        build-essential \
+        cpanminus \
+    && rm -rf \
+        /root/.cpanm \
+        /var/lib/apt/lists/*
+
+COPY . /infinitude
+WORKDIR /infinitude
+
+ENV LANG=C.UTF-8
+ENV LANGUAGE=C.UTF-8
+ENV LC_ALL=C.UTF-8
+
+ENV APP_SECRET="Pogotudinal"
+ENV PASS_REQS="1020"
+ENV MODE="Production"
+ENV SERIAL_TTY=""
+ENV SERIAL_SOCKET=""
+
+RUN chmod +x /infinitude/entrypoint.sh
+
+EXPOSE 3000
+
+ENTRYPOINT ["/infinitude/entrypoint.sh"]
