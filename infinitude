@@ -19,7 +19,7 @@ use XML::Simple::Minded;
 use Infinitude::MQTT;
 use Infinitude;
 
-my $store = CHI->new(
+our $store = CHI->new(
     driver         => 'File',
     root_dir       => 'state',
     depth          => 0,
