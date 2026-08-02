@@ -693,21 +693,6 @@ get '/systems/:id/config' => sub {
 	    };
 	  }
 
-	  # A Carrier-originated change produces TWO pull cycles: the branch above
-	  # sets changes => time+60, so the stat is told serverHasChanges again a
-	  # minute later and fetches config a second time. A locally-originated
-	  # change produces only one. Every config upload we have observed on live
-	  # hardware followed a double cycle, so mirror it here.
-	  #
-	  # push_retry bounds this to one extra cycle per 2 minutes; without it,
-	  # each forced cycle would set changes again and the stat would never
-	  # settle.
-	  if ($config->{carrier_push} and !$store->get('push_retry')) {
-	    $store->set(push_retry => time, 120);
-	    $store->set(changes => time+60);
-	    $c->app->log->info('carrier_push: forcing followup config cycle');
-	  }
-
 	  my $cfg = XML::Simple::Minded->new({config=>$struc});
 	  $c->render(text=>$cfg, format=>'xml');
 	}
