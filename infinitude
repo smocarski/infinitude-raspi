@@ -17,6 +17,7 @@ use Time::HiRes qw/time/;
 use Try::Tiny;
 use XML::Simple::Minded;
 use Infinitude::MQTT;
+use Infinitude::Carrier;
 use Infinitude;
 
 our $store = CHI->new(
@@ -53,6 +54,14 @@ $config->{serial_tty}    = $ENV{SERIAL_TTY}    || $config->{serial_tty};
 $config->{serial_socket} = $ENV{SERIAL_SOCKET} || $config->{serial_socket};
 $config->{app_secret}    = $ENV{APP_SECRET}    || $config->{app_secret};
 $config->{pass_reqs}     = $ENV{PASS_REQS}     || $config->{pass_reqs};
+# Carrier cloud push. Enabled only when both user and pass are set.
+$config->{carrier_user}   = $ENV{CARRIER_USER}   || $config->{carrier_user};
+$config->{carrier_pass}   = $ENV{CARRIER_PASS}   || $config->{carrier_pass};
+$config->{carrier_serial} = $ENV{CARRIER_SERIAL} || $config->{carrier_serial};
+$config->{carrier_dryrun} = $ENV{CARRIER_DRYRUN} || $config->{carrier_dryrun};
+# `//` here, not `||`: 0 is meaningful for both of these.
+$config->{carrier_push_delay}   = $ENV{CARRIER_PUSH_DELAY}   // $config->{carrier_push_delay};
+$config->{carrier_min_interval} = $ENV{CARRIER_MIN_INTERVAL} // $config->{carrier_min_interval};
 $config->{emulate_sam}   = $ENV{EMULATE_SAM}   || $config->{emulate_sam};
 $config->{emulate_zc}    = $ENV{EMULATE_ZC}    || $config->{emulate_zc};
 $config->{mqtt_broker}   = $ENV{MQTT_BROKER}   || $config->{mqtt_broker};
@@ -192,7 +201,16 @@ serial_init();
 
 # MQTT Discovery integration
 my $mqtt = Infinitude::MQTT->new(store => $store, config => $config, zc => $zc);
-$inf = Infinitude->new(store => $store, mqtt => $mqtt, sam => $sam);
+
+# Carrier cloud push. Local writes never depend on this succeeding; it only
+# marks fields dirty and pushes them on a coalescing timer.
+my $carrier = Infinitude::Carrier->new(
+    store => $store, config => $config, log => app->log);
+
+$inf = Infinitude->new(
+    store => $store, mqtt => $mqtt, sam => $sam, carrier => $carrier);
+
+$carrier->start if $carrier->enabled;
 
 # --- MQTT command wiring ---
 
@@ -663,30 +681,46 @@ get '/systems/:id/config' => sub {
 	  # Persist Carrier's config locally. Without this the stat gets the new
 	  # config but systems.xml keeps the old one, so Infinitude's own UI shows
 	  # stale values until the stat happens to upload its config back to us.
-	  try {
-	    my $incoming = decode_json(
-	      XML::Simple::Minded->new($c->stash->{pass_res})->config->_as_json);
-	    # Envelope fields belong on the wire, not in systems.xml
-	    delete @{$incoming}{qw/version timestamp xmlns:atom atom:link/};
+	  #
+	  # Unless we have local intent that hasn't reached Carrier yet: Carrier is
+	  # then answering with pre-change state, and persisting it would silently
+	  # discard what the user just asked for. The pending push reconciles.
+	  if ($carrier->has_pending) {
+	    $c->app->log->info('Carrier config ignored: local changes still pending');
+	  } else {
+	    try {
+	      my $incoming = decode_json(
+	        XML::Simple::Minded->new($c->stash->{pass_res})->config->_as_json);
+	      # Envelope fields belong on the wire, not in systems.xml
+	      delete @{$incoming}{qw/version timestamp xmlns:atom atom:link/};
 
-	    my $xml     = XML::Simple::Minded->new($store->get('systems.xml'));
-	    my $current = decode_json($xml->system->config->_as_json);
-	    # Overlay: Carrier wins where it speaks, but keep fields only the stat
-	    # reports (blower telemetry and friends) rather than dropping them.
-	    my $merged  = { %$current, %$incoming };
+	      my $xml     = XML::Simple::Minded->new($store->get('systems.xml'));
+	      my $current = decode_json($xml->system->config->_as_json);
+	      # Overlay: Carrier wins where it speaks, but keep fields only the stat
+	      # reports (blower telemetry and friends) rather than dropping them.
+	      my $merged  = { %$current, %$incoming };
 
-	    die "no mode in merged config\n" unless $merged->{mode};
-	    $xml->system->config([$merged]);
-	    my $out = "$xml";
-	    die "empty serialization\n" unless length($out) > 100;
+	      die "no mode in merged config\n" unless $merged->{mode};
+	      $xml->system->config([$merged]);
+	      my $out = "$xml";
+	      die "empty serialization\n" unless length($out) > 100;
 
-	    $store->set('systems.xml'  => $out);
-	    $store->set('systems.json' => $xml->_as_json);
-	    $mqtt->publish_state if $mqtt;
-	    $c->app->log->info('Persisted Carrier config to systems.xml');
-	  } catch {
-	    $c->app->log->error("Could not persist Carrier config: $_");
-	  };
+	      $store->set('systems.xml'  => $out);
+	      $store->set('systems.json' => $xml->_as_json);
+	      $c->app->log->info('Persisted Carrier config to systems.xml');
+
+	      # If this is our own push coming back, the values are already what
+	      # subscribers were told. Re-publishing would be a spurious update.
+	      my $digest = Infinitude::Carrier->config_digest($c->stash->{pass_res});
+	      if ($digest and $digest eq ($store->get('carrier_pushed_hash')//'')) {
+	        $c->app->log->info('Carrier config is our own echo, not republishing');
+	      } else {
+	        $mqtt->publish_state if $mqtt;
+	      }
+	    } catch {
+	      $c->app->log->error("Could not persist Carrier config: $_");
+	    };
+	  }
 
 	  $c->render(text=>$c->stash->{pass_res}, format=>'xml');
 	} else {

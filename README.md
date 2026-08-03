@@ -94,6 +94,37 @@ Infinitude configuration parameters can be passed through environment variables 
 | MQTT_PASS | Optional MQTT broker password |
 | MQTT_PREFIX | HA discovery prefix (default: `homeassistant`) |
 | MQTT_TOPIC | MQTT base topic (default: `infinitude`) |
+| CARRIER_USER | Carrier cloud account email. Enables pushing local changes up to Carrier (see below). Unset to disable. |
+| CARRIER_PASS | Carrier cloud account password |
+| CARRIER_SERIAL | System serial. Auto-detected from captured requests when unset |
+| CARRIER_DRYRUN | Build and log the cloud mutation without sending it |
+| CARRIER_PUSH_DELAY | Seconds of quiet before a push, so a slider drag becomes one write (default `5`) |
+| CARRIER_MIN_INTERVAL | Minimum seconds between pushes (default `10`) |
+
+### Pushing local changes to Carrier's cloud
+
+By default Carrier's cloud never learns about changes made in Infinitude. The
+thermostat applies them and posts a "System settings updated" notification, but
+never uploads the config itself — so the Carrier app keeps showing stale
+setpoints. Infinitude cannot upload on the thermostat's behalf either: Carrier
+authenticates thermostats with OAuth 1.0a signed by secrets held in firmware.
+
+Setting `CARRIER_USER` and `CARRIER_PASS` closes the gap from the other side, by
+authenticating as the account owner — the same way Carrier's own mobile app
+does — and writing the change to the cloud. Carrier then pushes it down to the
+thermostat through the path Infinitude already handles.
+
+Local writes never depend on this working. The local change is applied first and
+the cloud write is a best-effort side effect, so if Carrier is down or
+unreachable, control degrades to exactly the behaviour you get without these
+variables set.
+
+Covered: system mode, zone setpoints, zone fan, zone hold. **Not** covered:
+edits made through `/api/<path>` or the schedule editor, which write arbitrary
+fields and have no equivalent cloud operation.
+
+This depends on a private, undocumented Carrier API and can break without
+notice.
 
 
 the published container can be run as

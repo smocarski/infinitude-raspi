@@ -10,9 +10,10 @@ sub new {
     my ($class, %args) = @_;
     die "Infinitude: store required" unless $args{store};
     bless {
-        store => $args{store},
-        mqtt  => $args{mqtt},
-        sam   => $args{sam},
+        store   => $args{store},
+        mqtt    => $args{mqtt},
+        sam     => $args{sam},
+        carrier => $args{carrier},
     }, $class;
 }
 
@@ -36,6 +37,7 @@ sub set_system_mode {
         try { $self->{sam}->set_system_mode($mode) }
         catch { warn "RS485 mode write failed: $_" };
     }
+    $self->{carrier}->mark_dirty('mode') if $self->{carrier};
 }
 
 sub set_zone_setpoint {
@@ -62,6 +64,7 @@ sub set_zone_setpoint {
         try { $self->{sam}->set_zone_setpoint($zone_id, $actual_htsp, $actual_clsp) }
         catch { warn "RS485 setpoint write failed: $_" };
     }
+    $self->{carrier}->mark_dirty("zone_${zone_id}_setpoint") if $self->{carrier};
 }
 
 sub set_zone_fan {
@@ -81,6 +84,7 @@ sub set_zone_fan {
         try { $self->{sam}->set_zone_fan($zone_id, $fan) }
         catch { warn "RS485 fan write failed: $_" };
     }
+    $self->{carrier}->mark_dirty("zone_${zone_id}_fan") if $self->{carrier};
 }
 
 sub set_zone_hold {
@@ -97,6 +101,7 @@ sub set_zone_hold {
         $zone->holdActivity([$activity]);
         $zone->otmr([$until]);
     });
+    $self->{carrier}->mark_dirty("zone_${zone_id}_hold") if $self->{carrier};
 }
 
 sub _qtr_hr {
