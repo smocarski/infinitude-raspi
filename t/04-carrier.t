@@ -162,6 +162,33 @@ subtest 'wholeHouse hold is skipped rather than fatal' => sub {
     is(scalar @m, 0, 'no mutation, no exception');
 };
 
+subtest 'whole-document save is diffed into dirty keys' => sub {
+    # This is the path the web UI actually uses: POST /systems/infinitude
+    # saves the entire document rather than calling the domain methods.
+    my ($c) = make();
+
+    is($c->mark_from_diff($FIXTURE, $FIXTURE), 0, 'identical save marks nothing');
+    ok(!$c->has_pending, 'nothing queued for an unchanged save');
+
+    my $mode_changed = $FIXTURE;
+    $mode_changed =~ s{<config><mode>auto</mode>}{<config><mode>cool</mode>};
+    isnt($mode_changed, $FIXTURE, 'fixture was actually modified');
+    ok($c->mark_from_diff($FIXTURE, $mode_changed), 'mode change detected');
+    ok($c->has_pending, 'queued for push');
+
+    my ($c2) = make();
+    my $sp_changed = $FIXTURE;
+    $sp_changed =~ s{(<activity id="manual"><htsp>)([\d.]+)}{$1 . ($2 + 3)}se;
+    isnt($sp_changed, $FIXTURE, 'a manual setpoint was modified');
+    ok($c2->mark_from_diff($FIXTURE, $sp_changed), 'setpoint change detected');
+    ok((grep { /_setpoint$/ } keys %{ $c2->{dirty} }), 'marked a zone setpoint key')
+        or diag('dirty: ' . join(',', sort keys %{ $c2->{dirty} }));
+
+    my ($c3) = make();
+    is($c3->mark_from_diff($FIXTURE, 'not xml at all <'), undef,
+        'a malformed save is ignored rather than fatal');
+};
+
 subtest 'config_digest normalises Carrier float formatting' => sub {
     my $a = Infinitude::Carrier->config_digest('<config><clsp>78.0</clsp></config>');
     my $b = Infinitude::Carrier->config_digest('<config><clsp>78</clsp></config>');

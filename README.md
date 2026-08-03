@@ -119,9 +119,14 @@ the cloud write is a best-effort side effect, so if Carrier is down or
 unreachable, control degrades to exactly the behaviour you get without these
 variables set.
 
-Covered: system mode, zone setpoints, zone fan, zone hold. **Not** covered:
-edits made through `/api/<path>` or the schedule editor, which write arbitrary
-fields and have no equivalent cloud operation.
+Covered: system mode, zone setpoints, zone fan, and zone hold — whether the
+change comes from the web UI, an MQTT command, or the `/api` endpoints. The web
+UI saves the whole document rather than calling individual setters, so those
+saves are diffed against the previous document to work out what to push.
+
+**Not** covered: schedule/program edits, and any field without an equivalent
+cloud operation. Those still apply locally and reach the thermostat as before;
+they just do not reach Carrier.
 
 This depends on a private, undocumented Carrier API and can break without
 notice.

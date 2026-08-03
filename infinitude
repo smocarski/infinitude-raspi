@@ -607,8 +607,10 @@ any '/api/*variable_path' => sub {
 				$search->$key([$sets{$key}]);
 			}
 			$setting->{data} = { %{$search->TO_JSON()} };
+			my $before = $store->get('systems.xml');
 			$store->set('systems.xml',  $xml.'');
 			$store->set('systems.json', $xml->_as_json());
+			$carrier->mark_from_diff($before, $xml.'');
 			if (('POST' eq $c->req->method) or ('PUT' eq $c->req->method) or $set_changes) {
 				$store->set(changes => 'true');
 			}
@@ -656,10 +658,14 @@ get '/releaseNotes/#id' => sub {
 post '/systems/:id' => sub {
 	my $c = shift;
 	if ($c->stash('id') eq 'infinitude') { # Data is being saved from web client
+		my $before = $store->get('systems.xml');
 		my $xml = XML::Simple::Minded->new($c->req->json);
 		$store->set('systems.xml'  => $xml.'');
 		$store->set('systems.json' => $xml->_as_json);
 		$store->set(changes => 'true');
+		# The UI saves the whole document rather than calling the domain
+		# methods, so diff it to work out what to push to Carrier.
+		$carrier->mark_from_diff($before, $xml.'');
 	} else { # Data from thermostat.
 		if (!$c->stash('error')) {
 			if (my $key = $c->stash('store_key')) {

@@ -119,6 +119,59 @@ sub mark_dirty {
     return;
 }
 
+# The web UI does not use the domain methods: every edit is a whole-document
+# save through POST /systems/infinitude. Reduce a document to the fields we can
+# actually push, so a save can be diffed into the same dirty keys mark_dirty
+# would have set.
+sub _summary {
+    my ($self, $xml) = @_;
+    my %s;
+    my $cfg = $xml->system->config or return \%s;
+    $s{mode} = _v($cfg->mode);
+
+    my $zones = $cfg->zones->zone;
+    $zones = [$zones] unless ref($zones) eq 'ARRAY';
+    for my $z (@$zones) {
+        my $id = _v($z->id);
+        next if $id eq '';
+        $s{"zone_${id}_hold"} =
+            join '|', map { _v($z->$_) } qw/hold holdActivity otmr/;
+
+        my $acts = $z->activities->activity;
+        $acts = [$acts] unless ref($acts) eq 'ARRAY';
+        for my $act (@$acts) {
+            next unless _v($act->id) eq 'manual';
+            $s{"zone_${id}_setpoint"} = _v($act->htsp) . '|' . _v($act->clsp);
+            $s{"zone_${id}_fan"}      = _v($act->fan);
+        }
+    }
+    return \%s;
+}
+
+sub mark_from_diff {
+    my ($self, $before, $after) = @_;
+    return unless $self->{enabled};
+    return unless defined $after and length $after;
+
+    my $b = try { $self->_summary(XML::Simple::Minded->new($before // '')) };
+    my $a = try { $self->_summary(XML::Simple::Minded->new($after)) };
+    unless ($a) {
+        $self->_log(error => 'Carrier cloud: could not diff saved document');
+        return;
+    }
+    $b ||= {};
+
+    my @changed;
+    for my $key (sort keys %$a) {
+        next if defined $b->{$key} and $b->{$key} eq $a->{$key};
+        push @changed, $key;
+        $self->mark_dirty($key);
+    }
+    $self->_log(info => 'Carrier cloud: document save changed ' . join(', ', @changed))
+        if @changed;
+    return scalar @changed;
+}
+
 sub start {
     my $self = shift;
     return unless $self->{enabled};
