@@ -200,7 +200,7 @@ sub bus_loop_start {
 serial_init();
 
 # MQTT Discovery integration
-my $mqtt = Infinitude::MQTT->new(store => $store, config => $config, zc => $zc);
+my $mqtt = Infinitude::MQTT->new(store => $store, config => $config, zc => $zc, log => app->log);
 
 # Carrier cloud push. Local writes never depend on this succeeding; it only
 # marks fields dirty and pushes them on a coalescing timer.
@@ -211,6 +211,24 @@ $inf = Infinitude->new(
     store => $store, mqtt => $mqtt, sam => $sam, carrier => $carrier);
 
 $carrier->start if $carrier->enabled;
+
+app->log->info(sprintf 'Infinitude starting: mode=%s loglevel=%s pass_reqs=%s mqtt=%s carrier_push=%s',
+    $ENV{MODE} // app->mode,
+    $ENV{LOGLEVEL} // app->log->level,
+    $config->{pass_reqs} // 0,
+    $mqtt->enabled ? $config->{mqtt_broker} : 'disabled',
+    $carrier->enabled ? 'on' : 'off');
+
+# Thermostat watchdog. A stat that stops polling Infinitude is otherwise
+# completely silent in the logs.
+our $last_status_poll = time;
+our $poll_gap_warned  = 0;
+Mojo::IOLoop->recurring(60 => sub {
+    my $gap = time - $last_status_poll;
+    return if $poll_gap_warned or $gap <= 180;
+    $poll_gap_warned = 1;
+    app->log->warn(sprintf 'Thermostat has not polled for %dm', $gap / 60);
+});
 
 # --- MQTT command wiring ---
 
@@ -272,12 +290,14 @@ if ($mqtt->enabled) {
     );
 
     Mojo::IOLoop->timer(8 => sub {
-        $mqtt->publish_discovery;
-        $mqtt->publish_state;
-        app->log->info("MQTT: Discovery and state published");
+        $mqtt->announce;
+        app->log->info("MQTT: announced availability, discovery and state");
     });
 
     Mojo::IOLoop->recurring(60 => sub {
+        # Backstop: if a reconnect ever slips past tick's transition check,
+        # availability still recovers within a minute.
+        $mqtt->assert_online if $mqtt->connected;
         $mqtt->publish_if_status_changed;
     });
 
@@ -369,11 +389,26 @@ hook before_dispatch => sub {
 			$o_url->scheme('https');
 			$o_req->url($o_url);
 
-			$c->app->log->info("No cache for $nk. Make Carrier request");
+			$c->app->log->debug("No cache for $nk. Make Carrier request");
 			$store->set("req-$nk.txt", $o_req->to_string);
 			#say "REQUEST:\n".$o_req->to_string."\n------------";
 			my $ua = Mojo::UserAgent->new;
+			# This request blocks the event loop (MQTT, RS485, thermostat HTTP)
+			# for its whole duration, so cap how long a dead Carrier can stall us.
+			$ua->connect_timeout(5)->request_timeout(15);
+			my $started = time;
 			my $tx = $ua->start(Mojo::Transaction::HTTP->new(req=>$o_req));
+			my $took = sprintf '%.1f', time - $started;
+			my $code = $tx->res->code // 0;
+			if (my $err = $tx->error and $code != 404) {
+				# 404 is Carrier's normal answer for dealer, equipment_events etc.
+				my $why = $err->{code} ? "HTTP $err->{code} $err->{message}" : $err->{message};
+				$c->app->log->warn("Carrier relay $nk failed after ${took}s: $why");
+			} elsif ($took > 3) {
+				$c->app->log->warn("Carrier relay $nk slow: ${took}s (HTTP $code)");
+			} else {
+				$c->app->log->debug("Carrier relay $nk HTTP $code in ${took}s");
+			}
 			$store->set("res-$nk.txt", $tx->res->to_string);
 			#say "RESPONSE:\n".$store->get("res-$nk.txt");
 			$c->stash->{pass_res} = $tx->res->body;
@@ -381,13 +416,13 @@ hook before_dispatch => sub {
 			$store->set("$nk.xml", $tx->res->body)
 			  if (($tx->res->headers->content_type//'') =~ /xml/);
 		} else {
-			$c->app->log->info("$nk cached or passthru disabled");
+			$c->app->log->debug("$nk cached or passthru disabled");
 		}
 
 		#Mangle Internet-bound request to self
 		my $appurl = $c->url_for('/');
 		$url->base($appurl->base);
-		$c->app->log->info($url);
+		$c->app->log->debug($url);
 
 		#Stuff data into store
 		if (my $data = $c->req->param('data')) {
@@ -395,7 +430,7 @@ hook before_dispatch => sub {
 			try {
 				$xml = XML::Simple::Minded->new($data);
 				my ($store_key) = $url->path  =~ /.*\/(.*)$/;
-				$c->app->log->info("Saving $store_key");
+				$c->app->log->debug("Saving $store_key");
 				$store->set("$store_key.raw", $data);
 				$store->set("$store_key.xml" , $xml.'');
 				$store->set("$store_key.json", $xml->_as_json);
@@ -739,7 +774,7 @@ get '/systems/:id/config' => sub {
 get '/systems/:id' => sub {
 	my $c = shift;
 	my $xml = $store->get('systems.xml');
-	$c->app->log->info("-------- Getting systems.xml (".$c->stash('id').") from infinitude.");
+	$c->app->log->debug("Getting systems.xml (".$c->stash('id').") from infinitude");
 	$xml
 		? $c->render(text=>$xml.'', format=>'xml')
 		: $c->render(text=>'', format=>'txt');
@@ -751,6 +786,12 @@ post '/systems/:system_id/status' => sub {
 	if ($changes =~ /\d+/) {
 		$changes = (time>$changes) ? 'true' : ''
 	}
+
+	if ($poll_gap_warned) {
+	  app->log->info(sprintf 'Thermostat polling resumed after %dm', (time - $last_status_poll) / 60);
+	  $poll_gap_warned = 0;
+	}
+	$last_status_poll = time;
 
 	$changes = 'true' unless $store->get('systems.xml'); #Force a change cycle if we have no stat config
 	my $xml = XML::Simple::Minded->new({
@@ -764,15 +805,16 @@ post '/systems/:system_id/status' => sub {
 
 	# if infinitude has no changes, and this is a carrier passthru request, return carrier's response
 	if (!$changes and $c->stash->{pass_res}) {
-	  $c->app->log->info("********** Check Carrier/Bryant change flags ****************");
+	  $c->app->log->debug("Checking Carrier change flags");
 	  $xml = XML::Simple::Minded->new($c->stash->{pass_res});
 	  $xml->status->pingRate([12]);
 	  $changes = $xml->status->serverHasChanges eq 'true' ? 1 : 0;
+	  $c->app->log->info('Carrier reports pending changes') if $changes;
 	  $store->set(carrier_changes => time, 120) if $changes; # open a window to Carrier passthru, max of 2 minutes
 	}
 
 	if ($changes) {
-	  $c->app->log->info("********** There are changes. ****************");
+	  $c->app->log->info("Thermostat notified of pending changes");
 	  $store->set(changes=>'');
           $mqtt->publish_state if $mqtt;
 	}
@@ -784,10 +826,10 @@ any '/systems/:system_id/:part' => sub {
 	my $part = $c->stash->{'part'};
 	my $text = $c->stash->{pass_res};
 	if (defined($text) and length($text)) {
-		$c->app->log->info("Relaying Carrier response for: $part");
+		$c->app->log->debug("Relaying Carrier response for: $part");
 		$c->render(text=>$text, format=>$c->stash('format')||'xml');
 	} else {
-		$c->app->log->info("Unimplemented request: $part");
+		$c->app->log->debug("Unimplemented request: $part");
 		$c->render(text=>'', format=>'txt');
 	}
 };

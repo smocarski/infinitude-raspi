@@ -16,34 +16,66 @@ sub new {
         return bless { enabled => 0 }, $class;
     };
 
-    require Net::MQTT::Simple;
-
     my $prefix = $config->{mqtt_prefix} // 'homeassistant';
     my $base   = $config->{mqtt_topic}  // 'infinitude';
 
-    my $mqtt = Net::MQTT::Simple->new($broker);
-
-    if ($config->{mqtt_user}) {
-        $ENV{MQTT_SIMPLE_ALLOW_INSECURE_LOGIN} = 1 unless $broker =~ /^ssl:/i;
-        $mqtt->login($config->{mqtt_user}, $config->{mqtt_pass} // '');
+    my $mqtt = $args{client};
+    unless ($mqtt) {
+        require Net::MQTT::Simple;
+        # Bound the TCP connect. Net::MQTT::Simple sets no timeout, so an
+        # unreachable broker would block the whole event loop (thermostat
+        # HTTP, RS485) for the OS connect timeout on every reconnect attempt.
+        $mqtt = Net::MQTT::Simple->new($broker, { Timeout => 5 });
+        if ($config->{mqtt_user}) {
+            $ENV{MQTT_SIMPLE_ALLOW_INSECURE_LOGIN} = 1 unless $broker =~ /^ssl:/i;
+            $mqtt->login($config->{mqtt_user}, $config->{mqtt_pass} // '');
+        }
     }
 
     $mqtt->last_will("$base/status" => 'offline', 1);
 
     my $self = bless {
-        enabled => 1,
-        mqtt    => $mqtt,
-        store   => $store,
-        prefix  => $prefix,
-        base    => $base,
-        config  => $config,
-        zc      => $args{zc},  # CarBus::ZoneController (optional)
+        enabled   => 1,
+        mqtt      => $mqtt,
+        store     => $store,
+        prefix    => $prefix,
+        base      => $base,
+        broker    => $broker,
+        config    => $config,
+        log       => $args{log},
+        zc        => $args{zc},  # CarBus::ZoneController (optional)
+        connected => undef,      # unknown until the first tick
     }, $class;
 
     return $self;
 }
 
 sub enabled { shift->{enabled} }
+
+sub _log {
+    my ($self, $level, $msg) = @_;
+    return unless $self->{log};
+    $self->{log}->$level($msg);
+}
+
+# Mark ourselves available, then (re)publish discovery and state. The broker
+# holds a retained last will of 'offline' that it publishes whenever our
+# connection drops, so this has to run after every reconnect as well as at
+# startup - otherwise Home Assistant keeps every entity unavailable until the
+# process restarts.
+sub announce {
+    my ($self) = @_;
+    return unless $self->{enabled};
+    $self->assert_online;
+    $self->publish_discovery;
+    $self->publish_state;
+}
+
+sub assert_online {
+    my ($self) = @_;
+    return unless $self->{enabled};
+    $self->{mqtt}->retain($self->_topic('status') => 'online');
+}
 
 sub _topic { my $s = shift; join '/', $s->{base}, @_ }
 sub _disc  { my $s = shift; join '/', $s->{prefix}, @_ }
@@ -164,8 +196,6 @@ sub publish_discovery {
         my $msg   = shift @topics;
         $self->{mqtt}->retain($topic => $msg);
     }
-
-    $self->{mqtt}->retain($self->_topic('status') => 'online');
 }
 
 sub publish_state {
@@ -294,7 +324,18 @@ sub subscribe_commands {
         "$base/zone/+/temp_high/cmd" => sub { $self->_handle_temp_high(@_) },
         "$base/zone/+/fan/cmd"       => sub { $self->_handle_fan(@_) },
         "$base/zone/+/preset/cmd"    => sub { $self->_handle_preset(@_) },
+        # Home Assistant's birth message. When HA restarts, a broker that has
+        # lost its retained discovery configs leaves our entities gone until
+        # someone re-announces them.
+        "$self->{prefix}/status"     => sub { $self->_handle_ha_status(@_) },
     );
+}
+
+sub _handle_ha_status {
+    my ($self, $topic, $msg) = @_;
+    return unless lc($msg // '') eq 'online';
+    $self->announce;
+    $self->_log(info => 'MQTT: Home Assistant came online, re-announced');
 }
 
 sub _extract_zone {
@@ -349,10 +390,48 @@ sub _handle_preset {
     $self->{on_set_preset}->($zone, lc($msg)) if $self->{on_set_preset};
 }
 
+sub connected { !!shift->{connected} }
+
+# Net::MQTT::Simple reconnects and resubscribes on its own, but gives callers no
+# signal when that happens. Its tick() does return whether a socket is up, so
+# watch that for transitions: log them, and re-announce on recovery.
+my $STILL_DOWN_EVERY = 300;
+
 sub tick {
     my ($self) = @_;
     return unless $self->{enabled};
-    $self->{mqtt}->tick(0);
+
+    my $up  = $self->{mqtt}->tick(0) ? 1 : 0;
+    my $was = $self->{connected};
+    my $now = time;
+    $self->{connected} = $up;
+
+    if (!defined $was) {
+        if ($up) {
+            $self->_log(info => "MQTT: connected to $self->{broker}");
+        } else {
+            $self->_log(warn => "MQTT: cannot reach $self->{broker}, will keep retrying");
+            @{$self}{qw/down_since last_down_warn/} = ($now, $now);
+        }
+    }
+    elsif ($was and !$up) {
+        $self->_log(warn => "MQTT: connection to $self->{broker} lost, retrying");
+        @{$self}{qw/down_since last_down_warn/} = ($now, $now);
+    }
+    elsif (!$was and !$up) {
+        if ($now - ($self->{last_down_warn} // $now) >= $STILL_DOWN_EVERY) {
+            $self->_log(warn => sprintf 'MQTT: %s still unreachable after %dm',
+                $self->{broker}, ($now - $self->{down_since}) / 60);
+            $self->{last_down_warn} = $now;
+        }
+    }
+    elsif (!$was and $up) {
+        $self->_log(info => sprintf 'MQTT: reconnected to %s after %ds, re-announcing',
+            $self->{broker}, $now - ($self->{down_since} // $now));
+        $self->announce;
+    }
+
+    return $up;
 }
 
 my @STATUS_WATCH = qw(rt rh zoneconditioning fan currentActivity hold holdActivity otmr);

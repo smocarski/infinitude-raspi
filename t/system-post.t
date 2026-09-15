@@ -41,4 +41,22 @@ ok($xml_string =~ /<system\b/, 'systems.xml holds a system document');
 is($xml->system->config->mode.'', 'auto', 'config survived the round trip');
 ok(defined $main::store->get('systems17test.xml'), 'store_key artifacts written');
 
+# A routine thermostat status poll is per-request noise and must not log at
+# info. Before this was fixed every ~32s poll wrote three info lines.
+{
+    my @msgs;
+    $t->app->log->level('debug');
+    my $cb = $t->app->log->on(message => sub {
+        my ($log, $level, @lines) = @_;
+        push @msgs, [$level, join ' ', @lines];
+    });
+    $t->post_ok('/systems/systems17test/status' => {Host=>'infinitude'})->status_is(200);
+    $t->app->log->unsubscribe(message => $cb);
+
+    my @info = grep { $_->[0] =~ /^(info|warn|error|fatal)$/ } @msgs;
+    is(scalar @info, 0, 'routine status poll logs nothing above debug')
+        or diag(join "\n", map { "$_->[0]: $_->[1]" } @info);
+    ok((grep { $_->[0] eq 'debug' } @msgs), 'but still logs at debug');
+}
+
 done_testing();
