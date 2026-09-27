@@ -20,6 +20,7 @@ package MockClient {
     sub subscribe { my ($s, %kv) = @_; @{ $s->{subs} }{ keys %kv } = values %kv }
     sub onlines { scalar grep { $_->[0] eq 'infinitude/status' && $_->[1] eq 'online' } @{ shift->{retained} } }
     sub reset { shift->{retained} = [] }
+    sub _drop_connection { shift->{dropped}++ }
 }
 
 package MockLog {
@@ -115,6 +116,79 @@ subtest 'assert_online only publishes availability' => sub {
     my ($m, $client) = make();
     $m->assert_online;
     is_deeply($client->{retained}, [['infinitude/status', 'online']], 'single retained message');
+};
+
+subtest 'silent half-open connection is detected and reconnected' => sub {
+    my ($m, $client, $log) = make();
+    $m->subscribe_commands;
+    my $echo = $client->{subs}{'infinitude/status'};
+    ok($echo, 'subscribed to our own status topic');
+
+    $client->script(1, 1);
+    $m->tick;
+    $m->tick;
+    ok(!$client->{dropped}, 'fresh connection gets a grace period');
+
+    # An echo inside the window keeps the connection.
+    $m->{up_since} -= 1000;
+    $m->{last_rx}  -= 100;
+    $echo->('infinitude/status', 'online');
+    $client->script(1);
+    $m->tick;
+    ok(!$client->{dropped}, 'recent echo: no forced reconnect');
+
+    # Nothing back from the broker for longer than $STALE_AFTER.
+    $m->{last_rx} -= $Infinitude::MQTT::STALE_AFTER + 1;
+    $client->script(1);
+    $m->tick;
+    is($client->{dropped}, 1, 'forced reconnect');
+    is($log->count(warn => qr/no traffic from broker\.test:1883 for \d+s, forcing reconnect/), 1, 'logged');
+    is($log->count(warn => qr/connection to broker\.test:1883 lost/), 1, 'treated as a drop');
+    ok(!$m->connected, 'marked down');
+
+    $client->reset;
+    $client->script(1, 1);
+    $m->tick;
+    is($client->onlines, 1, 're-announced on recovery');
+    $m->tick;
+    is($client->{dropped}, 1, 'new connection is not immediately dropped again');
+};
+
+subtest "our own stale 'offline' last will is corrected" => sub {
+    my ($m, $client) = make();
+    $m->subscribe_commands;
+    my $echo = $client->{subs}{'infinitude/status'};
+
+    $echo->('infinitude/status', 'offline');
+    is($client->onlines, 0, 'not re-asserted before we are connected');
+
+    $client->script(1);
+    $m->tick;
+    $echo->('infinitude/status', 'offline');
+    is($client->onlines, 1, "'online' re-asserted");
+};
+
+subtest 'socket hardening' => sub {
+    use Socket qw/AF_UNIX SOCK_STREAM PF_UNSPEC SOL_SOCKET SO_KEEPALIVE/;
+    use IO::Socket::IP;
+
+    ok(!Infinitude::MQTT::_harden_socket(undef), 'no socket: no-op');
+    ok(!Infinitude::MQTT::_harden_socket({}), 'not a handle: no-op');
+
+    my $listen = IO::Socket::IP->new(Listen => 1, LocalHost => '127.0.0.1', LocalPort => 0)
+        or plan skip_all => 'cannot listen on loopback';
+    my $sock = IO::Socket::IP->new(PeerHost => '127.0.0.1', PeerPort => $listen->sockport)
+        or plan skip_all => 'cannot connect on loopback';
+    ok(Infinitude::MQTT::_harden_socket($sock), 'hardened');
+    ok(unpack('i', getsockopt($sock, SOL_SOCKET, SO_KEEPALIVE)), 'SO_KEEPALIVE set');
+
+    # tick hardens each new socket the client opens, once.
+    my ($m, $client) = make();
+    $client->{socket} = $sock;
+    setsockopt($sock, SOL_SOCKET, SO_KEEPALIVE, 0);
+    $client->script(1);
+    $m->tick;
+    ok(unpack('i', getsockopt($sock, SOL_SOCKET, SO_KEEPALIVE)), 'tick hardened the client socket');
 };
 
 done_testing();

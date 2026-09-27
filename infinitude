@@ -89,6 +89,10 @@ my @sam_poll_regs = (
 );
 my $sam_poll_idx = 0;
 my $sam_poll_sec = 0;
+my $bridge_down_logged = 0;
+# A TCP bridge that goes quiet this long is presumed dead (half-open) and
+# reopened. The ABCD bus is never silent for more than a few seconds.
+my $BRIDGE_SILENT_AFTER = 60;
 my $use_serial = ( (defined($config->{serial_tty})    and $config->{serial_tty})
                 or (defined($config->{serial_socket}) and $config->{serial_socket}) );
 
@@ -96,11 +100,11 @@ sub serial_init {
     return unless $use_serial;
     return if $init_attempt and time<($init_attempt+7);
     $init_attempt = time;
-    return unless $use_serial;
+    return if $handle;
     if (defined($config->{serial_tty}) and -e $config->{serial_tty}) {
         require IO::Termios;
         warn "Using $config->{serial_tty} serial interface\n";
-        $handle ||= IO::Termios->open($config->{serial_tty},"38400,8,n,1");
+        $handle = IO::Termios->open($config->{serial_tty},"38400,8,n,1");
     } else {
         warn "Can't find serial device: $config->{serial_tty}. Serial monitoring disabled.\n" if $config->{serial_tty};
         delete $config->{serial_tty};
@@ -110,24 +114,31 @@ sub serial_init {
         my ($host,$port) = split(':',$config->{serial_socket});
         $host //= 'localhost';
         $port //= 'telnet';
-        warn "Using $host port $port for serial interface\n";
-        $handle ||= IO::Socket::IP->new( PeerHost=>$host, PeerPort=>$port);
+        # Bounded: this runs on the event loop, and retries every few seconds
+        # while the bridge is unreachable.
+        $handle = IO::Socket::IP->new( PeerHost=>$host, PeerPort=>$port, Timeout=>5);
+        if ($handle) {
+            app->log->info("RS485: connected to bridge $host:$port");
+        } elsif (!$bridge_down_logged++) {
+            app->log->warn("RS485: cannot reach bridge $host:$port, will keep retrying");
+        }
     }
-    $carbus = CarBus->new($handle) if $handle;
-    if ($carbus) {
-        # Load device register parsers for bus monitoring
-        require CarBus::OutdoorUnit;
-        require CarBus::IndoorUnit;
-        require CarBus::ZoneController;
-    }
-    if ($handle and $config->{emulate_sam}) {
+    return unless $handle;
+    $bridge_down_logged = 0;
+    $lastframe = time;    # give a new connection a full silence window
+    $carbus = CarBus->new($handle);
+    # Load device register parsers for bus monitoring
+    require CarBus::OutdoorUnit;
+    require CarBus::IndoorUnit;
+    require CarBus::ZoneController;
+    if ($config->{emulate_sam}) {
         require CarBus::SAM;
         $sam = CarBus::SAM->new(bus => $carbus, emulated_src => 'SAM');
         $sam->initialize_defaults();
         $inf->{sam} = $sam if $inf;    # keep Infinitude module in sync after reconnect
         warn "SAM emulation enabled\n";
     }
-    if ($handle and $config->{emulate_zc}) {
+    if ($config->{emulate_zc}) {
         $zc = CarBus::ZoneController->new(bus => $carbus);
         warn "Zone Controller emulation enabled\n";
         warn "WARNING: ZC emulation is riskier than SAM emulation.\n";
@@ -140,9 +151,18 @@ sub serial_init {
 sub bus_loop_start {
     return if $busloop_id;
     $busloop_id = Mojo::IOLoop->recurring(0.0625 => sub {
-        serial_init() if (!$carbus or time>($lastframe+10));
+        if ($carbus and $handle->isa('IO::Socket')
+                and ($carbus->eof or time > $lastframe + $BRIDGE_SILENT_AFTER)) {
+            app->log->warn(sprintf 'RS485: bridge %s, reconnecting',
+                $carbus->eof ? 'closed the connection' : sprintf('silent for %ds', time - $lastframe));
+            close $handle;
+            undef $handle;
+            undef $carbus;
+        }
+        serial_init() if !$carbus;
+        return unless $carbus;
         # Active SAM polling - emulate real SAM querying thermostat registers
-        if ($sam and $carbus and time >= $sam_poll_sec + 3) {
+        if ($sam and time >= $sam_poll_sec + 3) {
             $sam_poll_sec = time;
             my $reg = $sam_poll_regs[$sam_poll_idx];
             my $poll_frame = $sam->read_thermostat($reg->[0], $reg->[1]);

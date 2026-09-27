@@ -5,6 +5,8 @@ use warnings;
 use feature ':5.10';
 use utf8;
 use Mojo::JSON qw/encode_json decode_json/;
+use Scalar::Util qw/blessed refaddr/;
+use Socket qw/SOL_SOCKET SO_KEEPALIVE SO_SNDTIMEO IPPROTO_TCP/;
 
 sub new {
     my ($class, %args) = @_;
@@ -324,6 +326,9 @@ sub subscribe_commands {
         "$base/zone/+/temp_high/cmd" => sub { $self->_handle_temp_high(@_) },
         "$base/zone/+/fan/cmd"       => sub { $self->_handle_fan(@_) },
         "$base/zone/+/preset/cmd"    => sub { $self->_handle_preset(@_) },
+        # Our own availability topic. We retain 'online' here every minute, so
+        # its echo proves the broker is really receiving and delivering.
+        "$base/status"               => sub { $self->_handle_own_status(@_) },
         # Home Assistant's birth message. When HA restarts, a broker that has
         # lost its retained discovery configs leaves our entities gone until
         # someone re-announces them.
@@ -336,6 +341,14 @@ sub _handle_ha_status {
     return unless lc($msg // '') eq 'online';
     $self->announce;
     $self->_log(info => 'MQTT: Home Assistant came online, re-announced');
+}
+
+sub _handle_own_status {
+    my ($self, $topic, $msg) = @_;
+    $self->{last_rx} = time;
+    # The broker just delivered our retained last will while we are talking to
+    # it: correct it rather than leave every entity unavailable.
+    $self->assert_online if lc($msg // '') eq 'offline' and $self->{connected};
 }
 
 sub _extract_zone {
@@ -395,7 +408,19 @@ sub connected { !!shift->{connected} }
 # Net::MQTT::Simple reconnects and resubscribes on its own, but gives callers no
 # signal when that happens. Its tick() does return whether a socket is up, so
 # watch that for transitions: log them, and re-announce on recovery.
+#
+# It also cannot see a half-open connection (Wi-Fi blip, broker restart behind
+# NAT): writes keep landing in the kernel buffer and tick() keeps saying "up"
+# for the 15-30 minutes TCP takes to give up. Its keepalive ping would catch
+# that, but it only pings after 60s without sending, and our own periodic
+# publishes keep resetting that clock. So check liveness end to end: our
+# retained status is re-published every minute and should echo back; if
+# nothing has arrived for $STALE_AFTER seconds, force a reconnect.
+#
+# _force_reconnect and _harden_socket reach into the library's private
+# {socket} and _drop_connection (stable since 1.0x); both are guarded.
 my $STILL_DOWN_EVERY = 300;
+our $STALE_AFTER     = 150;
 
 sub tick {
     my ($self) = @_;
@@ -404,7 +429,19 @@ sub tick {
     my $up  = $self->{mqtt}->tick(0) ? 1 : 0;
     my $was = $self->{connected};
     my $now = time;
+
+    $self->_watch_socket if $up;
+
+    if ($up and $was and $now - ($self->{last_rx} // $now) >= $STALE_AFTER
+            and $now - ($self->{up_since} // $now) >= $STALE_AFTER) {
+        $self->_log(warn => sprintf 'MQTT: no traffic from %s for %ds, forcing reconnect',
+            $self->{broker}, $now - $self->{last_rx});
+        $self->_force_reconnect;
+        $up = 0;
+    }
+
     $self->{connected} = $up;
+    @{$self}{qw/up_since last_rx/} = ($now, $now) if $up and !$was;
 
     if (!defined $was) {
         if ($up) {
@@ -432,6 +469,48 @@ sub tick {
     }
 
     return $up;
+}
+
+sub _force_reconnect {
+    my ($self) = @_;
+    my $client = $self->{mqtt};
+    if ($client->can('_drop_connection')) {
+        $client->_drop_connection;
+    } elsif (ref $client eq 'HASH' or blessed $client and $client->isa('HASH')) {
+        delete $client->{socket};
+    }
+    delete $self->{socket_seen};
+}
+
+# Harden each new socket the library opens.
+sub _watch_socket {
+    my ($self) = @_;
+    my $sock = eval { $self->{mqtt}{socket} } or return;
+    my $id = refaddr($sock);
+    return if ($self->{socket_seen} // 0) == $id;
+    $self->{socket_seen} = $id;
+    _harden_socket($sock);
+}
+
+# Keep a dead peer from hanging us. The library's socket is blocking, so once
+# the send buffer fills against a dead broker, syswrite would stall the whole
+# event loop (thermostat HTTP, RS485, web UI). A send timeout turns that into
+# an error, which the library handles by reconnecting. TCP keepalive and
+# TCP_USER_TIMEOUT (Linux) make the kernel notice a dead peer within ~a minute.
+sub _harden_socket {
+    my ($sock) = @_;
+    return unless blessed $sock and $sock->can('setsockopt') and defined fileno($sock);
+
+    eval { setsockopt($sock, SOL_SOCKET, SO_SNDTIMEO, pack('l! l!', 5, 0)) };
+    eval { setsockopt($sock, SOL_SOCKET, SO_KEEPALIVE, 1) };
+    for (['TCP_KEEPIDLE', 30], ['TCP_KEEPINTVL', 10], ['TCP_KEEPCNT', 3],
+         ['TCP_USER_TIMEOUT', 30_000]) {
+        my ($name, $val) = @$_;
+        my $opt = eval { Socket->can($name) && Socket->can($name)->() };
+        next unless defined $opt;
+        eval { setsockopt($sock, IPPROTO_TCP, $opt, $val) };
+    }
+    return 1;
 }
 
 my @STATUS_WATCH = qw(rt rh zoneconditioning fan currentActivity hold holdActivity otmr);

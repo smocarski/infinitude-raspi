@@ -15,6 +15,7 @@ has iosel => ( is=>'ro', lazy=>1, default=>sub{
     return IO::Select->new($self->fh);
 });
 has buffer => (is=>'rw', default=>'');
+has eof => (is=>'rw', default=>0);  # peer closed a socket handle
 has name => (is=>'ro', lazy=>1, default => sub {
     return join('-',ref($_[0]->fh), int(rand()*9999));
 });
@@ -69,6 +70,9 @@ sub fh_fill {
     return unless $self->iosel->can_read(0.05); #100 read checks per second
     my $buf = '';
     my $len = $self->fh->sysread($buf, MAX_BUFFER-$self->buflen);
+    # 0 means EOF: a closed TCP bridge. A non-blocking tty returns undef
+    # when empty, never 0.
+    $self->eof(1) if defined $len and $len == 0;
     $self->push_stream($buf) if defined $len;
     return $len;
 }
